@@ -1,9 +1,18 @@
+require('dotenv').config();
+
 const express = require('express');
 const axios = require('axios');
 const app = express();
 const port = 3000;
 
 app.use(express.json());
+
+//use your own API Key
+const API_KEY = process.env.ALPHA_VANTAGE_API_KEY;
+
+// Constants for strategies
+const BUY_THRESHOLD = -0.02;  // 2% drop
+const SELL_THRESHOLD = 0.03;  // 3% rise
 
 async function fetchMarketData() {
     try {
@@ -33,134 +42,154 @@ function movingAverageCrossoverStrategy(data, shortWindow = 12, longWindow = 26)
     const shortMA = calculateMA(data, shortWindow);
     const longMA = calculateMA(data, longWindow);
     
-    return data.map((item, index) => {
-        let signal = 0;
-        if (index >= longWindow - 1) {
-            signal = shortMA[index] > longMA[index] ? 1 : -1;
-        }
-        return {
-            ...item,
-            shortMA: shortMA[index],
-            longMA: longMA[index],
-            maSignal: signal  // Renamed to maSignal for clarity
-        };
-    });
+    return data.map((item, index) => ({
+        ...item,
+        shortMA: shortMA[index],
+        longMA: longMA[index],
+        maSignal: index >= longWindow - 1 ? 
+            (shortMA[index] > longMA[index] ? 1 : -1) : 0
+    }));
 }
 
 function momentumStrategy(data, lookbackPeriod = 20) {
+    return data.map((item, index) => ({
+        ...item,
+        momentum: index >= lookbackPeriod ?
+            (item.price - data[index - lookbackPeriod].price > 0 ? 1 : -1) : 0
+    }));
+}
+
+function thresholdStrategy(data) {
+    let lastBuyPrice = null;
     return data.map((item, index) => {
-        let momentumSignal = 0;
+        let signal = 0;
         
-        if (index >= lookbackPeriod) {
-            const priceChange = item.price - data[index - lookbackPeriod].price;
-            momentumSignal = priceChange > 0 ? 1 : -1;
+        if (index > 0) {
+            const priceChange = (item.price - data[index - 1].price) / data[index - 1].price;
+            
+            if (priceChange <= BUY_THRESHOLD && !lastBuyPrice) {
+                signal = 1;
+                lastBuyPrice = item.price;
+            } else if (lastBuyPrice && (item.price - lastBuyPrice) / lastBuyPrice >= SELL_THRESHOLD) {
+                signal = -1;
+                lastBuyPrice = null;
+            }
         }
         
-        return {
-            ...item,
-            momentum: momentumSignal
-        };
+        return { ...item, thresholdSignal: signal };
     });
 }
 
-function calculateReturns(data) {
-    let maPosition = 0, momentumPosition = 0;
-    let maTotalReturn = 0, momentumTotalReturn = 0;
-    let maTrades = [], momentumTrades = [];
-    
-    return data.map((item, index) => {
-        let maReturn = 0, momentumReturn = 0;
-        
-        if (index > 0) {
-            const priceReturn = (item.price - data[index - 1].price) / data[index - 1].price;
-            
-            // MA Strategy returns
-            maReturn = maPosition * priceReturn;
-            maTotalReturn += maReturn;
-            
-            // Momentum Strategy returns
-            momentumReturn = momentumPosition * priceReturn;
-            momentumTotalReturn += momentumReturn;
-            
-            // Record trades
-            if (maPosition !== item.maSignal && item.maSignal !== 0) {
-                maTrades.push({
+function calculateStrategyReturns(data, strategyKey) {
+    let returns = [];
+    let position = 0;
+    let lastTradePrice = null;
+    let totalReturn = 0;
+    let trades = [];
+
+    data.forEach((item, index) => {
+        if (index === 0) return;
+
+        const signal = item[strategyKey];
+        if (signal !== 0 && signal !== position) {
+            if (signal === 1) { // Buy signal
+                lastTradePrice = item.price;
+                trades.push({
                     date: item.date,
-                    type: item.maSignal === 1 ? 'BUY' : 'SELL',
-                    price: item.price,
-                    strategy: 'MA Crossover'
+                    type: 'BUY',
+                    price: item.price
                 });
-            }
-            
-            if (momentumPosition !== item.momentum && item.momentum !== 0) {
-                momentumTrades.push({
+            } else if (signal === -1 && lastTradePrice) { // Sell signal
+                const tradeReturn = (item.price - lastTradePrice) / lastTradePrice;
+                totalReturn += tradeReturn;
+                trades.push({
                     date: item.date,
-                    type: item.momentum === 1 ? 'BUY' : 'SELL',
+                    type: 'SELL',
                     price: item.price,
-                    strategy: 'Momentum'
+                    return: tradeReturn * 100
                 });
+                lastTradePrice = null;
             }
+            position = signal;
         }
         
-        maPosition = item.maSignal;
-        momentumPosition = item.momentum;
-        
-        return {
-            ...item,
-            maReturn,
-            maTotalReturn,
-            momentumReturn,
-            momentumTotalReturn
-        };
+        returns.push({
+            date: item.date,
+            return: totalReturn * 100 // Convert to percentage
+        });
     });
+
+    return {
+        returns,
+        trades,
+        finalReturn: totalReturn * 100
+    };
+}
+
+async function runStrategies() {
+    const marketData = await fetchMarketData();
+    if (!marketData) return null;
+    
+    let results = movingAverageCrossoverStrategy(marketData);
+    results = momentumStrategy(results);
+    results = thresholdStrategy(results);
+    
+    const maResults = calculateStrategyReturns(results, 'maSignal');
+    const momentumResults = calculateStrategyReturns(results, 'momentum');
+    const thresholdResults = calculateStrategyReturns(results, 'thresholdSignal');
+    
+    const initialPrice = marketData[0].price;
+    const finalPrice = marketData[marketData.length - 1].price;
+    const marketReturn = ((finalPrice - initialPrice) / initialPrice) * 100;
+
+    return {
+        marketPerformance: {
+            initialPrice,
+            finalPrice,
+            marketReturn,
+            dataPoints: marketData.length
+        },
+        strategies: {
+            movingAverage: {
+                finalReturn: maResults.finalReturn,
+                trades: maResults.trades
+            },
+            momentum: {
+                finalReturn: momentumResults.finalReturn,
+                trades: momentumResults.trades
+            },
+            threshold: {
+                finalReturn: thresholdResults.finalReturn,
+                trades: thresholdResults.trades
+            }
+        }
+    };
 }
 
 app.get('/run-strategies', async (req, res) => {
-    const marketData = await fetchMarketData();
-    if (!marketData) {
+    const results = await runStrategies();
+    if (!results) {
         return res.status(500).json({ error: 'Failed to fetch market data' });
     }
     
-    // Apply both strategies
-    let results = movingAverageCrossoverStrategy(marketData);
-    results = momentumStrategy(results);
-    
-    // Calculate returns for both strategies
-    const returnsData = calculateReturns(results);
-    
-    // Calculate summary statistics
-    const lastData = returnsData[returnsData.length - 1];
-    const maTrades = returnsData.filter((d, i) => 
-        i > 0 && d.maSignal !== returnsData[i-1].maSignal && d.maSignal !== 0
-    );
-    const momentumTrades = returnsData.filter((d, i) => 
-        i > 0 && d.momentum !== returnsData[i-1].momentum && d.momentum !== 0
-    );
-    
-    // Prepare sample data
-    const sampleData = returnsData.slice(0, 5).concat(returnsData.slice(-5));
-    
     res.json({
-        summary: {
-            maStrategy: {
-                totalReturn: lastData.maTotalReturn * 100,
-                numberOfTrades: maTrades.length
+        marketPerformance: results.marketPerformance,
+        strategyPerformance: {
+            movingAverage: {
+                return: results.strategies.movingAverage.finalReturn.toFixed(2) + '%',
+                numberOfTrades: results.strategies.movingAverage.trades.length,
+                recentTrades: results.strategies.movingAverage.trades.slice(-3)
             },
-            momentumStrategy: {
-                totalReturn: lastData.momentumTotalReturn * 100,
-                numberOfTrades: momentumTrades.length
+            momentum: {
+                return: results.strategies.momentum.finalReturn.toFixed(2) + '%',
+                numberOfTrades: results.strategies.momentum.trades.length,
+                recentTrades: results.strategies.momentum.trades.slice(-3)
             },
-            marketData: {
-                firstPrice: marketData[0].price,
-                lastPrice: marketData[marketData.length - 1].price,
-                percentChange: ((marketData[marketData.length - 1].price - marketData[0].price) / marketData[0].price) * 100,
-                dataPoints: marketData.length
+            threshold: {
+                return: results.strategies.threshold.finalReturn.toFixed(2) + '%',
+                numberOfTrades: results.strategies.threshold.trades.length,
+                recentTrades: results.strategies.threshold.trades.slice(-3)
             }
-        },
-        sampleData,
-        trades: {
-            ma: maTrades.slice(0, 5),
-            momentum: momentumTrades.slice(0, 5)
         }
     });
 });
