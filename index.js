@@ -10,11 +10,10 @@ async function fetchMarketData() {
         const response = await axios.get('https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol=IBM&interval=5min&outputsize=full&apikey=demo');
         const timeSeries = response.data['Time Series (5min)'];
         
-        // Convert API data to our format
         return Object.entries(timeSeries).map(([timestamp, values]) => ({
             date: timestamp,
             price: parseFloat(values['4. close'])
-        })).reverse(); // Reverse to get chronological order
+        })).reverse();
     } catch (error) {
         console.error('Error fetching market data:', error);
         return null;
@@ -43,72 +42,126 @@ function movingAverageCrossoverStrategy(data, shortWindow = 12, longWindow = 26)
             ...item,
             shortMA: shortMA[index],
             longMA: longMA[index],
-            signal
+            maSignal: signal  // Renamed to maSignal for clarity
+        };
+    });
+}
+
+function momentumStrategy(data, lookbackPeriod = 20) {
+    return data.map((item, index) => {
+        let momentumSignal = 0;
+        
+        if (index >= lookbackPeriod) {
+            const priceChange = item.price - data[index - lookbackPeriod].price;
+            momentumSignal = priceChange > 0 ? 1 : -1;
+        }
+        
+        return {
+            ...item,
+            momentum: momentumSignal
         };
     });
 }
 
 function calculateReturns(data) {
-    let position = 0;
-    let totalReturn = 0;
-    let trades = [];
+    let maPosition = 0, momentumPosition = 0;
+    let maTotalReturn = 0, momentumTotalReturn = 0;
+    let maTrades = [], momentumTrades = [];
     
     return data.map((item, index) => {
-        let strategyReturn = 0;
+        let maReturn = 0, momentumReturn = 0;
         
         if (index > 0) {
             const priceReturn = (item.price - data[index - 1].price) / data[index - 1].price;
-            strategyReturn = position * priceReturn;
-            totalReturn += strategyReturn;
             
-            // Record trade if position changes
-            if (position !== item.signal && item.signal !== 0) {
-                trades.push({
+            // MA Strategy returns
+            maReturn = maPosition * priceReturn;
+            maTotalReturn += maReturn;
+            
+            // Momentum Strategy returns
+            momentumReturn = momentumPosition * priceReturn;
+            momentumTotalReturn += momentumReturn;
+            
+            // Record trades
+            if (maPosition !== item.maSignal && item.maSignal !== 0) {
+                maTrades.push({
                     date: item.date,
-                    type: item.signal === 1 ? 'BUY' : 'SELL',
-                    price: item.price
+                    type: item.maSignal === 1 ? 'BUY' : 'SELL',
+                    price: item.price,
+                    strategy: 'MA Crossover'
+                });
+            }
+            
+            if (momentumPosition !== item.momentum && item.momentum !== 0) {
+                momentumTrades.push({
+                    date: item.date,
+                    type: item.momentum === 1 ? 'BUY' : 'SELL',
+                    price: item.price,
+                    strategy: 'Momentum'
                 });
             }
         }
         
-        position = item.signal;
+        maPosition = item.maSignal;
+        momentumPosition = item.momentum;
         
         return {
             ...item,
-            strategyReturn,
-            totalReturn
+            maReturn,
+            maTotalReturn,
+            momentumReturn,
+            momentumTotalReturn
         };
     });
 }
 
-app.get('/run-strategy', async (req, res) => {
+app.get('/run-strategies', async (req, res) => {
     const marketData = await fetchMarketData();
     if (!marketData) {
         return res.status(500).json({ error: 'Failed to fetch market data' });
     }
     
-    const strategyResults = movingAverageCrossoverStrategy(marketData);
-    const returnsData = calculateReturns(strategyResults);
+    // Apply both strategies
+    let results = movingAverageCrossoverStrategy(marketData);
+    results = momentumStrategy(results);
+    
+    // Calculate returns for both strategies
+    const returnsData = calculateReturns(results);
     
     // Calculate summary statistics
-    const finalReturn = returnsData[returnsData.length - 1].totalReturn;
-    const trades = returnsData.filter((d, i) => 
-        i > 0 && d.signal !== returnsData[i-1].signal && d.signal !== 0
+    const lastData = returnsData[returnsData.length - 1];
+    const maTrades = returnsData.filter((d, i) => 
+        i > 0 && d.maSignal !== returnsData[i-1].maSignal && d.maSignal !== 0
+    );
+    const momentumTrades = returnsData.filter((d, i) => 
+        i > 0 && d.momentum !== returnsData[i-1].momentum && d.momentum !== 0
     );
     
-    // Sample results for demonstration
+    // Prepare sample data
     const sampleData = returnsData.slice(0, 5).concat(returnsData.slice(-5));
     
     res.json({
         summary: {
-            totalReturn: finalReturn * 100,
-            numberOfTrades: trades.length,
-            firstPrice: marketData[0].price,
-            lastPrice: marketData[marketData.length - 1].price,
-            dataPoints: marketData.length
+            maStrategy: {
+                totalReturn: lastData.maTotalReturn * 100,
+                numberOfTrades: maTrades.length
+            },
+            momentumStrategy: {
+                totalReturn: lastData.momentumTotalReturn * 100,
+                numberOfTrades: momentumTrades.length
+            },
+            marketData: {
+                firstPrice: marketData[0].price,
+                lastPrice: marketData[marketData.length - 1].price,
+                percentChange: ((marketData[marketData.length - 1].price - marketData[0].price) / marketData[0].price) * 100,
+                dataPoints: marketData.length
+            }
         },
         sampleData,
-        trades: trades.slice(0, 5) // First 5 trades
+        trades: {
+            ma: maTrades.slice(0, 5),
+            momentum: momentumTrades.slice(0, 5)
+        }
     });
 });
 
